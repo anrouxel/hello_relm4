@@ -1,0 +1,8 @@
+[package]
+name = "hello_relm4"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+relm4 = { version = "0.10.0", features = ["libadwaita", "gnome_48"] }
+relm4-components = "0.10.0"
