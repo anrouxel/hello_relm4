@@ -501,6 +501,7 @@ dependencies = [
  "libadwaita",
  "relm4",
  "relm4-components",
+ "tracing",
 ]
 
 [[package]]
