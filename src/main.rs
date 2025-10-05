@@ -1,73 +1,20 @@
+mod actions;
+mod components;
+mod models;
+mod utils;
+
 use adw::prelude::*;
-use relm4::prelude::*;
-use relm4::gtk;
+use adw::{AboutDialog, ApplicationWindow};
+use gtk::{gio, FileDialog, FileFilter, Orientation};
 use relm4::actions::{RelmAction, RelmActionGroup};
-use relm4::factory::FactoryVecDeque;
-use adw::{ActionRow, AboutDialog, ApplicationWindow};
-use gtk::{gio, FileDialog, FileFilter, ListBox, SelectionMode, Orientation};
-use std::fs;
+use relm4::prelude::*;
 use std::path::PathBuf;
 
-// Actions pour les raccourcis clavier
-relm4::new_action_group!(WindowActionGroup, "win");
-relm4::new_stateless_action!(OpenFileAction, WindowActionGroup, "open-file");
-relm4::new_stateless_action!(OpenFolderAction, WindowActionGroup, "open-folder");
-relm4::new_stateless_action!(ConvertAction, WindowActionGroup, "convert");
+use actions::{ConvertAction, OpenFileAction, OpenFolderAction, WindowActionGroup};
+use components::{FileList, FileListMsg, FileListOutput, Header, HeaderOutput};
+use utils::scan_audio_files;
 
-fn is_audio_extension(ext: &str) -> bool {
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus"
-    )
-}
-
-#[derive(Debug, Clone)]
-struct AudioFile {
-    path: PathBuf,
-}
-
-#[derive(Debug)]
-enum AudioFileMsg {
-    Activate,
-}
-
-#[relm4::factory]
-impl FactoryComponent for AudioFile {
-    type Init = PathBuf;
-    type Input = AudioFileMsg;
-    type Output = ();
-    type CommandOutput = ();
-    type ParentWidget = ListBox;
-
-    view! {
-        #[root]
-        ActionRow {
-            set_activatable: true,
-            #[watch]
-            set_title: &self.path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.path.display().to_string()),
-            
-            connect_activated[sender] => move |_| {
-                sender.input(AudioFileMsg::Activate);
-            }
-        }
-    }
-
-    fn init_model(path: Self::Init, _index: &DynamicIndex, _sender: FactorySender<Self>) -> Self {
-        AudioFile { path }
-    }
-
-    fn update(&mut self, msg: Self::Input, _sender: FactorySender<Self>) {
-        match msg {
-            AudioFileMsg::Activate => {
-                eprintln!("Ligne activée : {}", self.path.display());
-            }
-        }
-    }
-}
-
+/// Messages gérés par l'application principale
 #[derive(Debug)]
 enum AppMsg {
     OpenFile,
@@ -77,10 +24,13 @@ enum AppMsg {
     About,
     AddFile(PathBuf),
     AddFolder(PathBuf),
+    FileListChanged(usize),
 }
 
+/// Structure principale de l'application
 struct App {
-    audio_files: FactoryVecDeque<AudioFile>,
+    header: Controller<Header>,
+    file_list: Controller<FileList>,
     window: ApplicationWindow,
 }
 
@@ -99,49 +49,11 @@ impl SimpleComponent for App {
             gtk::Box {
                 set_orientation: Orientation::Vertical,
 
-                adw::HeaderBar {
-                    pack_start = &gtk::Button {
-                        set_label: "Convertir",
-                        set_tooltip_text: Some("Convertir (Ctrl+R)"),
-                        connect_clicked => AppMsg::Convert,
-                    },
+                #[local_ref]
+                header_widget -> adw::HeaderBar {},
 
-                    pack_start = &gtk::Button {
-                        set_icon_name: "document-open-symbolic",
-                        set_tooltip_text: Some("Choisir un fichier audio (Ctrl+O)"),
-                        connect_clicked => AppMsg::OpenFile,
-                    },
-
-                    pack_start = &gtk::Button {
-                        set_icon_name: "folder-symbolic",
-                        set_tooltip_text: Some("Choisir un dossier (Ctrl+F)"),
-                        connect_clicked => AppMsg::OpenFolder,
-                    },
-
-                    pack_end = &gtk::Button {
-                        set_icon_name: "help-about-symbolic",
-                        set_tooltip_text: Some("À propos"),
-                        connect_clicked => AppMsg::About,
-                    },
-
-                    pack_end = &gtk::Button {
-                        set_icon_name: "preferences-system-symbolic",
-                        set_tooltip_text: Some("Préférences"),
-                        connect_clicked => AppMsg::Preferences,
-                    },
-                },
-
-                gtk::ScrolledWindow {
-                    set_vexpand: true,
-                    set_hexpand: true,
-
-                    #[local_ref]
-                    file_list -> ListBox {
-                        set_margin_all: 16,
-                        set_selection_mode: SelectionMode::None,
-                        add_css_class: "boxed-list",
-                    }
-                }
+                #[local_ref]
+                file_list_widget -> gtk::ScrolledWindow {},
             }
         }
     }
@@ -151,14 +63,33 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let audio_files = FactoryVecDeque::builder()
-            .launch(ListBox::default())
-            .detach();
+        // Initialisation du composant Header
+        let header = Header::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                HeaderOutput::OpenFile => AppMsg::OpenFile,
+                HeaderOutput::OpenFolder => AppMsg::OpenFolder,
+                HeaderOutput::Convert => AppMsg::Convert,
+                HeaderOutput::Preferences => AppMsg::Preferences,
+                HeaderOutput::About => AppMsg::About,
+            });
+
+        // Initialisation du composant FileList
+        let file_list = FileList::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
+                FileListOutput::FilesChanged(count) => AppMsg::FileListChanged(count),
+            });
 
         let window = root.clone();
-        let model = App { audio_files, window };
+        let model = App {
+            header,
+            file_list,
+            window,
+        };
 
-        let file_list = model.audio_files.widget();
+        let header_widget = model.header.widget();
+        let file_list_widget = model.file_list.widget();
         let widgets = view_output!();
 
         // Configuration des actions et raccourcis clavier
@@ -196,90 +127,100 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
         match msg {
             AppMsg::OpenFile => {
-                let sender_clone = _sender.clone();
-                let dialog = FileDialog::new();
-                dialog.set_title("Ouvrir un fichier audio");
-                
-                let audio_filter = FileFilter::new();
-                audio_filter.set_name(Some("Fichiers audio"));
-                audio_filter.add_mime_type("audio/*");
-                
-                let filters = gio::ListStore::new::<FileFilter>();
-                filters.append(&audio_filter);
-                dialog.set_filters(Some(&filters));
-                
-                let window: gtk::Window = self.window.clone().upcast();
-                dialog.open(
-                    Some(&window),
-                    gio::Cancellable::NONE,
-                    move |result| {
-                        if let Ok(file) = result {
-                            if let Some(path) = file.path() {
-                                sender_clone.input(AppMsg::AddFile(path));
-                            }
-                        }
-                    },
-                );
+                self.open_file_dialog(_sender.clone());
             }
             AppMsg::OpenFolder => {
-                let sender_clone = _sender.clone();
-                let dialog = FileDialog::new();
-                dialog.set_title("Choisir un dossier");
-                
-                let window: gtk::Window = self.window.clone().upcast();
-                dialog.select_folder(
-                    Some(&window),
-                    gio::Cancellable::NONE,
-                    move |result| {
-                        if let Ok(file) = result {
-                            if let Some(path) = file.path() {
-                                sender_clone.input(AppMsg::AddFolder(path));
-                            }
-                        }
-                    },
-                );
+                self.open_folder_dialog(_sender.clone());
             }
             AppMsg::Convert => {
-                eprintln!("Conversion lancée pour {} fichiers", self.audio_files.len());
-                for (idx, file) in self.audio_files.iter().enumerate() {
-                    eprintln!("  {} - {}", idx + 1, file.path.display());
-                }
+                eprintln!("Conversion lancée");
+                // Ici, vous pouvez accéder aux fichiers via self.file_list
+                // et implémenter la logique de conversion
             }
             AppMsg::Preferences => {
                 eprintln!("Préférences cliqué");
             }
             AppMsg::About => {
-                let about = AboutDialog::new();
-                about.set_application_name("First App");
-                about.set_version("0.1");
-                about.set_comments("Application de conversion audio — exemple avec Relm4");
-                about.set_developers(&["Développeur"]);
-                
-                about.present(Some(&self.window));
+                self.show_about_dialog();
             }
             AppMsg::AddFile(path) => {
                 eprintln!("Fichier audio choisi : {}", path.display());
-                self.audio_files.guard().push_back(path);
+                self.file_list.emit(FileListMsg::AddFile(path));
             }
             AppMsg::AddFolder(folder) => {
                 eprintln!("Dossier choisi : {}", folder.display());
-                if let Ok(entries) = fs::read_dir(&folder) {
-                    let mut guard = self.audio_files.guard();
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.is_file() {
-                            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                                if is_audio_extension(ext) {
-                                    guard.push_back(p);
-                                }
-                            }
-                        }
+                match scan_audio_files(&folder) {
+                    Ok(files) => {
+                        self.file_list.emit(FileListMsg::AddFiles(files));
                     }
-                } else {
-                    eprintln!("Impossible de lire le dossier: {}", folder.display());
+                    Err(e) => {
+                        eprintln!("Impossible de lire le dossier: {} - {}", folder.display(), e);
+                    }
                 }
             }
+            AppMsg::FileListChanged(count) => {
+                eprintln!("Nombre de fichiers dans la liste : {}", count);
+            }
         }
+    }
+}
+
+impl App {
+    /// Affiche le dialogue de sélection de fichier
+    fn open_file_dialog(&self, sender: ComponentSender<Self>) {
+        let dialog = FileDialog::new();
+        dialog.set_title("Ouvrir un fichier audio");
+        
+        let audio_filter = FileFilter::new();
+        audio_filter.set_name(Some("Fichiers audio"));
+        audio_filter.add_mime_type("audio/*");
+        
+        let filters = gio::ListStore::new::<FileFilter>();
+        filters.append(&audio_filter);
+        dialog.set_filters(Some(&filters));
+        
+        let window: gtk::Window = self.window.clone().upcast();
+        dialog.open(
+            Some(&window),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        sender.input(AppMsg::AddFile(path));
+                    }
+                }
+            },
+        );
+    }
+
+    /// Affiche le dialogue de sélection de dossier
+    fn open_folder_dialog(&self, sender: ComponentSender<Self>) {
+        let dialog = FileDialog::new();
+        dialog.set_title("Choisir un dossier");
+        
+        let window: gtk::Window = self.window.clone().upcast();
+        dialog.select_folder(
+            Some(&window),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        sender.input(AppMsg::AddFolder(path));
+                    }
+                }
+            },
+        );
+    }
+
+    /// Affiche le dialogue "À propos"
+    fn show_about_dialog(&self) {
+        let about = AboutDialog::new();
+        about.set_application_name("First App");
+        about.set_version("0.1");
+        about.set_comments("Application de conversion audio — exemple avec Relm4");
+        about.set_developers(&["Développeur"]);
+        
+        about.present(Some(&self.window));
     }
 }
 
